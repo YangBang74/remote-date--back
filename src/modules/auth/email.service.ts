@@ -55,7 +55,7 @@ class EmailService {
       })
     }
 
-    return this.transporter
+    return this.transporter as unknown as nodemailer.Transporter
   }
 
   /**
@@ -86,7 +86,7 @@ class EmailService {
     try {
       const info = await transporter.sendMail(mailOptions)
       console.log('✅ Verification code sent to', email)
-      
+
       // В режиме разработки выводим ссылку на просмотр email (для Ethereal)
       if (info.messageId && nodemailer.getTestMessageUrl) {
         const testUrl = nodemailer.getTestMessageUrl(info)

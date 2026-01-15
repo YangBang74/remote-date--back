@@ -1,10 +1,11 @@
-import { v4 as uuidv4 } from 'uuid'
 import * as bcrypt from 'bcrypt'
-import type { RegisterDto, RegisterCheckDto, LoginDto, User, VerificationCode } from './auth.types'
+import type { RegisterDto, RegisterCheckDto, LoginDto, VerificationCode } from './auth.types'
 import { emailService } from './email.service'
+import { User, IUser } from './user.model'
+import { RefreshToken } from './refresh-token.model'
+import { jwtService } from './jwt.service'
 
 class AuthService {
-  private users: Map<string, User> = new Map()
   private verificationCodes: Map<string, VerificationCode> = new Map()
   private readonly CODE_EXPIRY_MINUTES = 15
 
@@ -32,19 +33,19 @@ class AuthService {
       throw new Error('Password must be at least 6 characters')
     }
 
-    // Проверяем, существует ли пользователь
-    const existingUser = Array.from(this.users.values()).find(
-      (u) => u.email.toLowerCase() === email.toLowerCase()
-    )
+    const normalizedEmail = email.toLowerCase()
+
+    // Проверяем, существует ли пользователь в БД
+    const existingUser = await User.findOne({ email: normalizedEmail })
 
     if (existingUser && existingUser.verified) {
       throw new Error('User with this email already exists')
     }
 
-    // Если пользователь существует, но не подтвержден, удаляем старый код
+    // Если пользователь существует, но не подтвержден, удаляем его и старый код
     if (existingUser) {
-      this.verificationCodes.delete(existingUser.email.toLowerCase())
-      this.users.delete(existingUser.id)
+      await User.deleteOne({ _id: existingUser._id })
+      this.verificationCodes.delete(normalizedEmail)
     }
 
     // Генерируем код подтверждения
@@ -54,30 +55,38 @@ class AuthService {
 
     // Сохраняем код
     const verificationCode: VerificationCode = {
-      email: email.toLowerCase(),
+      email: normalizedEmail,
       code,
       expiresAt,
     }
-    this.verificationCodes.set(email.toLowerCase(), verificationCode)
+    this.verificationCodes.set(normalizedEmail, verificationCode)
 
-    // Хешируем пароль и создаем временного пользователя (не подтвержденного)
+    // Хешируем пароль
     const hashedPassword = await bcrypt.hash(password, 10)
-    const tempUser: User = {
-      id: uuidv4(),
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      createdAt: new Date(),
-      verified: false,
+
+    // Создаем нового пользователя в БД (не подтвержденного)
+    try {
+      const newUser = new User({
+        email: normalizedEmail,
+        password: hashedPassword,
+        verified: false,
+      })
+      await newUser.save()
+    } catch (error: any) {
+      // Если ошибка уникальности (дубликат email), значит пользователь уже существует
+      if (error.code === 11000 || error.name === 'MongoServerError') {
+        throw new Error('User with this email already exists')
+      }
+      throw error
     }
-    this.users.set(tempUser.id, tempUser)
 
     // Отправляем код на email
     try {
       await emailService.sendVerificationCode(email, code)
     } catch (error: any) {
       // Если не удалось отправить email, удаляем временные данные
-      this.verificationCodes.delete(email.toLowerCase())
-      this.users.delete(tempUser.id)
+      this.verificationCodes.delete(normalizedEmail)
+      await User.deleteOne({ email: normalizedEmail })
       throw new Error('Failed to send verification code. Please try again.')
     }
 
@@ -90,11 +99,15 @@ class AuthService {
   /**
    * Проверка кода подтверждения и завершение регистрации
    */
-  async registerCheck(dto: RegisterCheckDto): Promise<{ message: string; userId: string }> {
+  async registerCheck(
+    dto: RegisterCheckDto
+  ): Promise<{ message: string; userId: string; token: string }> {
     const { email, code } = dto
 
+    const normalizedEmail = email.toLowerCase()
+
     // Получаем код подтверждения
-    const verificationCode = this.verificationCodes.get(email.toLowerCase())
+    const verificationCode = this.verificationCodes.get(normalizedEmail)
 
     if (!verificationCode) {
       throw new Error('Verification code not found or expired')
@@ -102,7 +115,7 @@ class AuthService {
 
     // Проверяем срок действия
     if (new Date() > verificationCode.expiresAt) {
-      this.verificationCodes.delete(email.toLowerCase())
+      this.verificationCodes.delete(normalizedEmail)
       throw new Error('Verification code has expired')
     }
 
@@ -111,38 +124,57 @@ class AuthService {
       throw new Error('Invalid verification code')
     }
 
-    // Находим пользователя
-    const user = Array.from(this.users.values()).find(
-      (u) => u.email.toLowerCase() === email.toLowerCase()
-    )
+    // Находим пользователя в БД
+    const user = await User.findOne({ email: normalizedEmail })
 
     if (!user) {
       throw new Error('User not found')
     }
 
-    // Подтверждаем пользователя
+    // Подтверждаем пользователя в БД
     user.verified = true
-    this.users.set(user.id, user)
+    await user.save()
 
     // Удаляем использованный код
-    this.verificationCodes.delete(email.toLowerCase())
+    this.verificationCodes.delete(normalizedEmail)
+
+    const userId = user._id.toString()
+
+    // Генерируем access и refresh токены
+    const accessToken = jwtService.generateAccessToken({
+      userId,
+      email: user.email,
+    })
+    const refreshToken = jwtService.generateRefreshToken()
+
+    // Сохраняем refresh token в БД
+    const refreshTokenExpiry = jwtService.getRefreshTokenExpiry()
+    await RefreshToken.create({
+      userId,
+      token: refreshToken,
+      expiresAt: refreshTokenExpiry,
+    })
 
     return {
       message: 'Registration successful',
-      userId: user.id,
+      userId,
+      accessToken,
+      refreshToken,
     }
   }
 
   /**
    * Вход в систему
    */
-  async login(dto: LoginDto): Promise<{ message: string; userId: string; email: string }> {
+  async login(
+    dto: LoginDto
+  ): Promise<{ message: string; userId: string; email: string; accessToken: string; refreshToken: string }> {
     const { email, password } = dto
 
-    // Находим пользователя
-    const user = Array.from(this.users.values()).find(
-      (u) => u.email.toLowerCase() === email.toLowerCase()
-    )
+    const normalizedEmail = email.toLowerCase()
+
+    // Находим пользователя в БД
+    const user = await User.findOne({ email: normalizedEmail })
 
     if (!user) {
       throw new Error('Invalid email or password')
@@ -159,29 +191,112 @@ class AuthService {
       throw new Error('Invalid email or password')
     }
 
+    const userId = user._id.toString()
+
+    // Генерируем access и refresh токены
+    const accessToken = jwtService.generateAccessToken({
+      userId,
+      email: user.email,
+    })
+    const refreshToken = jwtService.generateRefreshToken()
+
+    // Сохраняем refresh token в БД
+    const refreshTokenExpiry = jwtService.getRefreshTokenExpiry()
+    await RefreshToken.create({
+      userId,
+      token: refreshToken,
+      expiresAt: refreshTokenExpiry,
+    })
+
     return {
       message: 'Login successful',
-      userId: user.id,
+      userId,
       email: user.email,
+      accessToken,
+      refreshToken,
     }
   }
 
   /**
    * Получить пользователя по ID
    */
-  getUserById(userId: string): User | null {
-    return this.users.get(userId) || null
+  async getUserById(userId: string): Promise<IUser | null> {
+    try {
+      return await User.findById(userId)
+    } catch (error) {
+      return null
+    }
   }
 
   /**
    * Получить пользователя по email
    */
-  getUserByEmail(email: string): User | null {
-    return (
-      Array.from(this.users.values()).find(
-        (u) => u.email.toLowerCase() === email.toLowerCase()
-      ) || null
-    )
+  async getUserByEmail(email: string): Promise<IUser | null> {
+    return await User.findOne({ email: email.toLowerCase() })
+  }
+
+  /**
+   * Обновление access токена с помощью refresh токена
+   */
+  async refreshAccessToken(
+    refreshToken: string
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    // Находим refresh token в БД
+    const tokenDoc = await RefreshToken.findOne({ token: refreshToken })
+
+    if (!tokenDoc) {
+      throw new Error('Invalid refresh token')
+    }
+
+    // Проверяем срок действия
+    if (new Date() > tokenDoc.expiresAt) {
+      await RefreshToken.deleteOne({ _id: tokenDoc._id })
+      throw new Error('Refresh token has expired')
+    }
+
+    // Находим пользователя
+    const user = await User.findById(tokenDoc.userId)
+
+    if (!user || !user.verified) {
+      throw new Error('User not found or not verified')
+    }
+
+    // Генерируем новые токены
+    const newAccessToken = jwtService.generateAccessToken({
+      userId: user._id.toString(),
+      email: user.email,
+    })
+    const newRefreshToken = jwtService.generateRefreshToken()
+
+    // Удаляем старый refresh token
+    await RefreshToken.deleteOne({ _id: tokenDoc._id })
+
+    // Сохраняем новый refresh token
+    const refreshTokenExpiry = jwtService.getRefreshTokenExpiry()
+    await RefreshToken.create({
+      userId: user._id.toString(),
+      token: newRefreshToken,
+      expiresAt: refreshTokenExpiry,
+    })
+
+    return {
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+    }
+  }
+
+  /**
+   * Выход из системы (удаление refresh token)
+   */
+  async logout(refreshToken: string): Promise<void> {
+    await RefreshToken.deleteOne({ token: refreshToken })
+  }
+
+  /**
+   * Выход из всех устройств (удаление всех refresh tokens пользователя)
+   */
+  async logoutAll(userId: string): Promise<void> {
+    await RefreshToken.deleteMany({ userId })
   }
 }
 
